@@ -7,9 +7,9 @@ build/
 .eggs/
 *.egg
 
-# Model weights and data
-models/
-data/
+# Model weights and data (cached HuggingFace models)
+/models/
+/data/
 *.gguf
 *.safetensors
 *.bin
