@@ -119,12 +119,20 @@ class CausalLMTrainer:
         # Gradient accumulation
         gradient_accumulation_steps: int = 1,
         
+        # GPU performance
+        use_amp: bool = True,       # Automatic Mixed Precision (fp16/bf16)
+        amp_dtype: str = "bfloat16", # "float16" or "bfloat16" (bf16 preferred on A100)
+        compile_model: bool = False, # torch.compile for extra speed (requires PyTorch 2.0+)
+        
         # Checkpointing
         save_every_steps: int = 0,  # 0 = only save at end
         save_dir: Optional[str] = None,
         
         # Logging
         log_every_steps: int = 10,
+        
+        # DataLoader
+        num_workers: int = 0,       # DataLoader workers (set >0 for large datasets)
         
         # Callbacks
         on_step_end: Optional[Callable] = None,
@@ -149,10 +157,15 @@ class CausalLMTrainer:
         
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
+        self.use_amp = use_amp
+        self.amp_dtype = amp_dtype
+        self.compile_model = compile_model
+        
         self.save_every_steps = save_every_steps
         self.save_dir = Path(save_dir) if save_dir else None
         
         self.log_every_steps = log_every_steps
+        self.num_workers = num_workers
         
         self.on_step_end = on_step_end
         self.on_epoch_end = on_epoch_end
@@ -231,6 +244,30 @@ class CausalLMTrainer:
             ModuleResult with training metrics and loss history
         """
         device = next(model.parameters()).device
+        is_cuda = device.type == "cuda"
+        
+        # Setup AMP (Automatic Mixed Precision)
+        # AMP gives ~2x throughput on A100 with negligible quality loss
+        use_amp = self.use_amp and is_cuda
+        if use_amp:
+            amp_dtype = torch.bfloat16 if self.amp_dtype == "bfloat16" else torch.float16
+            scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
+            # bf16 doesn't need scaler (no inf/nan risk), but fp16 does
+            self._log(f"AMP enabled: {self.amp_dtype}")
+        else:
+            amp_dtype = torch.float32
+            # On CPU, use a no-op scaler (scale/unscale/step/update all pass through)
+            if is_cuda:
+                scaler = torch.amp.GradScaler("cuda", enabled=False)
+                self._log("AMP disabled (training in fp32)")
+            else:
+                scaler = None  # No scaler on CPU
+        
+        # Optional torch.compile (PyTorch 2.0+)
+        if self.compile_model and hasattr(torch, "compile"):
+            self._log("Compiling model with torch.compile...")
+            model = torch.compile(model)
+            self._log("Compilation complete")
         
         # Create dataset and dataloader
         dataset = CausalLMDataset(
@@ -240,9 +277,12 @@ class CausalLMTrainer:
         dataloader = dataset.get_dataloader(
             batch_size=self.batch_size,
             shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=is_cuda,  # Faster CPU→GPU transfer
         )
         
         stats = dataset.stats()
+        self._log(f"Device: {device}")
         self._log(f"Dataset: {stats['total_tokens']:,} tokens, {stats['num_chunks']} chunks")
         self._log(f"Block size: {self.block_size}, Batch size: {self.batch_size}")
         
@@ -289,38 +329,60 @@ class CausalLMTrainer:
             optimizer.zero_grad()
             
             for batch_idx, batch in enumerate(dataloader):
-                # Move batch to device
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
+                # Move batch to device (non_blocking for async GPU transfer with pin_memory)
+                input_ids = batch["input_ids"].to(device, non_blocking=is_cuda)
+                labels = batch["labels"].to(device, non_blocking=is_cuda)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=is_cuda)
                 
                 step_start = time.time()
                 
-                # Forward pass
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
-                loss = outputs.loss / self.gradient_accumulation_steps
+                # Forward pass with AMP autocast (only on CUDA)
+                if use_amp:
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                        )
+                        loss = outputs.loss / self.gradient_accumulation_steps
+                else:
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    loss = outputs.loss / self.gradient_accumulation_steps
                 
                 # Backward pass
-                loss.backward()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
                 
                 epoch_loss += outputs.loss.item() * input_ids.shape[0]
                 epoch_tokens += attention_mask.sum().item()
                 
                 # Optimizer step (with gradient accumulation)
                 if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    if self.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), self.max_grad_norm
-                        )
+                    if scaler is not None:
+                        # Gradient clipping (unscale first for fp16)
+                        if self.max_grad_norm > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), self.max_grad_norm
+                            )
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # CPU path: direct gradient clipping and step
+                        if self.max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), self.max_grad_norm
+                            )
+                        optimizer.step()
                     
-                    optimizer.step()
                     scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)  # More memory efficient
                     global_step += 1
                     
                     step_time = time.time() - step_start
@@ -360,7 +422,7 @@ class CausalLMTrainer:
             
             # Validation
             if val_dataloader is not None:
-                val_loss = self._validate(model, val_dataloader, device)
+                val_loss = self._validate(model, val_dataloader, device, amp_dtype, use_amp)
                 history["val_loss"].append(val_loss)
                 self._log(f"  Epoch {epoch+1} val loss: {val_loss:.4f}")
                 
@@ -414,23 +476,32 @@ class CausalLMTrainer:
             },
         )
     
-    def _validate(self, model, dataloader, device) -> float:
+    def _validate(self, model, dataloader, device, amp_dtype=torch.float32, use_amp=False) -> float:
         """Run validation and return average loss."""
         model.eval()
         total_loss = 0
         total_batches = 0
+        is_cuda = device.type == "cuda"
         
         with torch.no_grad():
             for batch in dataloader:
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
+                input_ids = batch["input_ids"].to(device, non_blocking=is_cuda)
+                labels = batch["labels"].to(device, non_blocking=is_cuda)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=is_cuda)
                 
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
+                if use_amp:
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                        )
+                else:
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
                 total_loss += outputs.loss.item()
                 total_batches += 1
         

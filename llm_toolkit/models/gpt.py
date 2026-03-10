@@ -32,11 +32,30 @@ Example:
 """
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Tuple, NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class ModelOutput:
+    """HuggingFace-compatible model output.
+    
+    Allows both attribute access (output.loss) and tuple unpacking (logits, loss = output).
+    This lets our GPT work with the existing trainer (expects .loss) AND
+    with direct tuple unpacking in tests.
+    """
+    def __init__(self, logits: torch.Tensor, loss: Optional[torch.Tensor] = None):
+        self.logits = logits
+        self.loss = loss
+    
+    def __iter__(self):
+        yield self.logits
+        yield self.loss
+    
+    def __getitem__(self, idx):
+        return (self.logits, self.loss)[idx]
 
 
 @dataclass
@@ -323,19 +342,25 @@ class GPT(nn.Module):
         self,
         input_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> ModelOutput:
         """Forward pass.
         
         Args:
             input_ids: Token indices (batch, seq_len)
             targets: Target token indices for loss (batch, seq_len)
+            labels: Alias for targets (HuggingFace convention)
             attention_mask: Not used for causal LM (kept for API compatibility)
         
         Returns:
-            logits: (batch, seq_len, vocab_size)
-            loss: Cross-entropy loss if targets provided, else None
+            ModelOutput with .logits and .loss attributes.
+            Also supports tuple unpacking: logits, loss = model(x, targets=y)
         """
+        # Accept either 'targets' or 'labels' (HuggingFace convention)
+        if labels is not None and targets is None:
+            targets = labels
+        
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, \
             f"Sequence length {T} exceeds max {self.config.max_seq_len}"
@@ -364,7 +389,7 @@ class GPT(nn.Module):
                 ignore_index=-100,  # Standard ignore index for padding
             )
         
-        return logits, loss
+        return ModelOutput(logits, loss)
     
     @torch.no_grad()
     def generate(

@@ -1,2 +1,2 @@
-from .gpt import GPT, GPTConfig
-__all__ = ["GPT", "GPTConfig"]
+from .gpt import GPT, GPTConfig, ModelOutput
+__all__ = ["GPT", "GPTConfig", "ModelOutput"]
